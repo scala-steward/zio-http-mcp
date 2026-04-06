@@ -282,13 +282,35 @@ The server auto-declares capabilities based on what's registered.
 
 ### HTTP Endpoints
 
-`server.routes` provides three endpoints:
+`server.routes` provides stateful Streamable HTTP with session tracking and SSE:
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/mcp` | All JSON-RPC requests and notifications |
 | GET | `/mcp` | SSE stream for server-initiated messages |
 | DELETE | `/mcp` | Session cleanup |
+
+### Stateless Mode
+
+`server.statelessRoutes` provides a stateless transport where each request is independent — no session tracking, no SSE, and tool calls return plain JSON:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/mcp` | All JSON-RPC requests and notifications |
+| GET | `/mcp` | 405 Method Not Allowed |
+| DELETE | `/mcp` | 405 Method Not Allowed |
+
+In stateless mode:
+- `initialize` does not return an `Mcp-Session-Id` header
+- No session validation on subsequent requests
+- Tool calls return `application/json` instead of SSE
+- Sampling and elicitation are not available (no persistent connection for server-to-client requests)
+
+```scala
+object Main extends ZIOAppDefault:
+  def run =
+    Server.serve(server.statelessRoutes).provide(Server.default)
+```
 
 ### Running
 

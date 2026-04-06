@@ -56,6 +56,14 @@ All MCP communication uses JSON-RPC 2.0 over UTF-8. Three message types:
 - Server MUST validate `Origin` header (DNS rebinding protection)
 - Supports resumability via SSE event IDs and `Last-Event-ID`
 
+**Stateless mode** (per MCP spec — session ID is optional):
+- Server does not assign or require `MCP-Session-Id`
+- Each request is independent — no server-side session tracking
+- GET and DELETE return 405 Method Not Allowed
+- Tool calls return `application/json` (not SSE)
+- Server-to-client features (sampling, elicitation) are not available
+- Use `server.statelessRoutes` instead of `server.routes`
+
 Note: stdio transport is not supported. This library targets HTTP-based deployments via ZIO HTTP.
 
 ### Lifecycle
@@ -253,15 +261,18 @@ val mcpServer = McpServer("my-server", "1.0.0")
   .tool(getWeather)
   .tool(deleteTool)
 
-// Produces Routes that handle the Streamable HTTP transport
+// Stateful: session tracking, SSE streaming, sampling/elicitation
 val routes: Routes[WeatherService & DeleteService, Nothing] = mcpServer.routes
+
+// Stateless: no sessions, plain JSON responses, no SSE
+val statelessRoutes: Routes[WeatherService & DeleteService, Nothing] = mcpServer.statelessRoutes
 
 // Mount alongside other app routes
 val app = routes ++ myOtherRoutes
 Server.serve(app)
 ```
 
-The library handles:
+`routes` (stateful) handles:
 - `POST /` — JSON-RPC message dispatch (initialize, tools/list, tools/call, ping, etc.)
 - `GET /` — SSE stream for server-initiated messages (notifications)
 - `DELETE /` — session termination
@@ -272,6 +283,14 @@ The library handles:
 - Pagination of `tools/list` responses
 - Progress notification forwarding
 - Cancellation handling (interrupts the ZIO fiber for the tool call)
+
+`statelessRoutes` handles:
+- `POST /` — JSON-RPC message dispatch (same methods, no session validation)
+- `GET /` — 405 Method Not Allowed
+- `DELETE /` — 405 Method Not Allowed
+- Origin header validation
+- Tool calls return `application/json` (not SSE)
+- Sampling and elicitation are not available (uses noop tool context)
 
 Note: Dynamic tool registration (add/remove at runtime) is not supported. The tool list is fixed at server construction time.
 

@@ -58,12 +58,18 @@ final class McpServer[-R] private (
       Method.DELETE / "mcp" -> handler(deleteHandler),
     ).sandbox
 
+  def statelessRoutes: Routes[R, Response] =
+    Routes(
+      Method.POST / "mcp" -> handler(statelessPostHandler),
+      Method.GET / "mcp"  -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
+      Method.DELETE / "mcp" -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
+    ).sandbox
+
   private def validateOrigin(request: Request): ZIO[Any, Response, Unit] =
     request.rawHeader("origin") match
       case Some(o) =>
         val originHost = o.replaceFirst("^https?://", "").toLowerCase
-        if McpServer.isLocalhostHost(originHost) then ZIO.unit
-        else ZIO.fail(Response.status(Status.Forbidden))
+        ZIO.unless(McpServer.isLocalhostHost(originHost))(ZIO.fail(Response.status(Status.Forbidden))).unit
       case None =>
         ZIO.unit
 
@@ -72,11 +78,64 @@ final class McpServer[-R] private (
       _              <- validateOrigin(request)
       sessions       <- McpServer.sessions
       pendingReqs    <- McpServer.pendingRequests
-      body           <- request.body.asString.mapError(_ => badRequest("Failed to read request body"))
+      body           <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
       bodyJson       <- ZIO.fromEither(body.fromJson[Json.Obj])
                           .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
       response       <- routeMessage(request, sessions, pendingReqs, bodyJson)
     yield response
+
+  private def statelessPostHandler(request: Request): ZIO[R, Response, Response] =
+    for
+      _        <- validateOrigin(request)
+      body     <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
+      bodyJson <- ZIO.fromEither(body.fromJson[Json.Obj])
+                    .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
+      message  <- ZIO.fromEither(bodyJson.toJson.fromJson[JsonRpcMessage])
+                    .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
+      response <- message match
+        case JsonRpcMessage.Request(id, "initialize", params) =>
+          handleInitializeResult(id, params).map(jsonRpcResponse(id, _))
+        case JsonRpcMessage.Request(id, method, params) =>
+          dispatchMethod(id, method, params, statelessHandleToolsCall)
+        case JsonRpcMessage.Notification(_, _) =>
+          ZIO.succeed(Response.ok)
+    yield response
+
+  // --- Shared method dispatch (used by both stateful and stateless) ---
+
+  private def dispatchMethod[R1 <: R](
+    id: RequestId,
+    method: String,
+    params: Option[Json.Obj],
+    onToolsCall: (RequestId, Option[Json.Obj]) => ZIO[R1, Response, Response],
+  ): ZIO[R1, Response, Response] =
+    method match
+      case "ping" =>
+        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
+      case "tools/list" =>
+        handleToolsList(id, params)
+      case "tools/call" =>
+        onToolsCall(id, params)
+      case "resources/list" =>
+        handleResourcesList(id)
+      case "resources/templates/list" =>
+        handleResourceTemplatesList(id)
+      case "resources/read" =>
+        handleResourceRead(id, params)
+      case "resources/subscribe" =>
+        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
+      case "resources/unsubscribe" =>
+        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
+      case "prompts/list" =>
+        handlePromptsList(id)
+      case "prompts/get" =>
+        handlePromptsGet(id, params)
+      case "logging/setLevel" =>
+        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
+      case "completion/complete" =>
+        handleCompletionComplete(id, params)
+      case _ =>
+        ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
 
   private def routeMessage(
     request: Request,
@@ -131,44 +190,9 @@ final class McpServer[-R] private (
     method match
       case "initialize" =>
         handleInitialize(sessions, id, params)
-      case "ping" =>
-        withSession(request, sessions):
-          ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "tools/list" =>
-        withSession(request, sessions):
-          handleToolsList(id, params)
-      case "tools/call" =>
-        withSession(request, sessions):
-          handleToolsCall(id, params, pendingReqs)
-      case "resources/list" =>
-        withSession(request, sessions):
-          handleResourcesList(id)
-      case "resources/templates/list" =>
-        withSession(request, sessions):
-          handleResourceTemplatesList(id)
-      case "resources/read" =>
-        withSession(request, sessions):
-          handleResourceRead(id, params)
-      case "resources/subscribe" =>
-        withSession(request, sessions):
-          ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "resources/unsubscribe" =>
-        withSession(request, sessions):
-          ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "prompts/list" =>
-        withSession(request, sessions):
-          handlePromptsList(id)
-      case "prompts/get" =>
-        withSession(request, sessions):
-          handlePromptsGet(id, params)
-      case "logging/setLevel" =>
-        withSession(request, sessions):
-          ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "completion/complete" =>
-        withSession(request, sessions):
-          handleCompletionComplete(id, params)
       case _ =>
-        ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
+        withSession(request, sessions):
+          dispatchMethod(id, method, params, handleToolsCall(_, _, pendingReqs))
 
   private def handleNotification(
     request: Request,
@@ -183,8 +207,8 @@ final class McpServer[-R] private (
           case Some(sid) =>
             sessions.update(_.updatedWith(sid):
               case Some(_) => Some(SessionState.Active)
-              case None    => None
-            ) *> ZIO.succeed(Response.ok)
+              case None => None
+            ).as(Response.ok)
           case None =>
             ZIO.succeed(Response.ok)
       case "notifications/cancelled" =>
@@ -192,24 +216,30 @@ final class McpServer[-R] private (
       case _ =>
         ZIO.succeed(Response.ok)
 
+  private def handleInitializeResult(
+    id: RequestId,
+    params: Option[Json.Obj],
+  ): ZIO[Any, Response, Json] =
+    val paramsJson = params.getOrElse(Json.Obj()).toJson
+    ZIO.fromEither(paramsJson.fromJson[InitializeParams]).mapBoth(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"), {
+      _ =>
+        InitializeResult(
+          protocolVersion = McpProtocol.Version,
+          capabilities = serverCapabilities,
+          serverInfo = serverInfo,
+        ).toJsonAST.toOption.get
+    })
+
   private def handleInitialize(
     sessions: Ref[Map[SessionId, SessionState]],
     id: RequestId,
     params: Option[Json.Obj],
   ): ZIO[Any, Response, Response] =
-    val paramsJson = params.getOrElse(Json.Obj()).toJson
-    ZIO.fromEither(paramsJson.fromJson[InitializeParams])
-      .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"))
-      .flatMap: initParams =>
-        val sessionId = SessionId.generate
-        val result = InitializeResult(
-          protocolVersion = McpProtocol.Version,
-          capabilities = serverCapabilities,
-          serverInfo = serverInfo,
-        )
-        sessions.update(_.updated(sessionId, SessionState.Initializing)).as:
-          jsonRpcResponse(id, result.toJsonAST.toOption.get)
-            .addHeader("mcp-session-id", sessionId.value)
+    handleInitializeResult(id, params).flatMap: result =>
+      val sessionId = SessionId.generate
+      sessions.update(_.updated(sessionId, SessionState.Initializing)).as:
+        jsonRpcResponse(id, result)
+          .addHeader("mcp-session-id", sessionId.value)
 
   private def handleToolsList(
     id: RequestId,
@@ -219,11 +249,10 @@ final class McpServer[-R] private (
     val result = ToolsListResult(tools = toolDefs)
     ZIO.succeed(jsonRpcResponse(id, result.toJsonAST.toOption.get))
 
-  private def handleToolsCall(
+  private def resolveToolCall(
     id: RequestId,
     params: Option[Json.Obj],
-    pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
-  ): ZIO[R, Response, Response] =
+  ): ZIO[Any, Response, (McpToolHandlerR[R], ToolCallParams)] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
     ZIO.fromEither(paramsJson.fromJson[ToolCallParams])
       .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid tool call params: $e"))
@@ -232,24 +261,46 @@ final class McpServer[-R] private (
           case None =>
             ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown tool: ${callParams.name}"))
           case Some(tool) =>
-            val progressToken = params.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get("progressToken"))
-            Queue.unbounded[JsonRpcMessage].flatMap: queue =>
-              val ctx = McpToolContext.make(queue, pendingReqs, progressToken)
-              val toolEffect = tool.callWithContext(callParams.arguments, ctx)
+            ZIO.succeed((tool, callParams))
 
-              // Fork the tool, stream messages + result as SSE
-              Promise.make[Nothing, CallToolResult].flatMap: resultPromise =>
-                val runTool = toolEffect
-                  .flatMap(resultPromise.succeed)
-                  .catchAllDefect: defect =>
-                    val errorResult = CallToolResult(
-                      content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
-                      isError = Some(true),
-                    )
-                    resultPromise.succeed(errorResult)
-                  .ensuring(queue.shutdown)
-                runTool.fork.as:
-                  sseToolCallResponse(id, queue, resultPromise)
+  private def handleToolsCall(
+    id: RequestId,
+    params: Option[Json.Obj],
+    pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
+  ): ZIO[R, Response, Response] =
+    resolveToolCall(id, params).flatMap: (tool, callParams) =>
+      val progressToken = params.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get("progressToken"))
+      Queue.unbounded[JsonRpcMessage].flatMap: queue =>
+        val ctx = McpToolContext.make(queue, pendingReqs, progressToken)
+        val toolEffect = tool.callWithContext(callParams.arguments, ctx)
+
+        // Fork the tool, stream messages + result as SSE
+        Promise.make[Nothing, CallToolResult].flatMap: resultPromise =>
+          val runTool = toolEffect
+            .flatMap(resultPromise.succeed)
+            .catchAllDefect: defect =>
+              val errorResult = CallToolResult(
+                content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
+                isError = Some(true),
+              )
+              resultPromise.succeed(errorResult)
+            .ensuring(queue.shutdown)
+          runTool.fork.as:
+            sseToolCallResponse(id, queue, resultPromise)
+
+  private def statelessHandleToolsCall(
+    id: RequestId,
+    params: Option[Json.Obj],
+  ): ZIO[R, Response, Response] =
+    resolveToolCall(id, params).flatMap: (tool, callParams) =>
+      tool.callWithContext(callParams.arguments, McpToolContext.noop)
+        .catchAllDefect: defect =>
+          ZIO.succeed(CallToolResult(
+            content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
+            isError = Some(true),
+          ))
+        .map: result =>
+          jsonRpcResponse(id, result.toJsonAST.toOption.get)
 
   private def handleResourcesList(id: RequestId): ZIO[Any, Nothing, Response] =
     val result = ResourcesListResult(resources = resources.map(_.definition))
@@ -283,7 +334,7 @@ final class McpServer[-R] private (
 
   private def matchesTemplate(tmpl: McpResourceTemplateHandler, uri: String): Boolean =
     val pattern = tmpl.definition.uriTemplate
-    val regex = pattern.replaceAll("\\{[^}]+\\}", "([^/]+)")
+    val regex = pattern.replaceAll("\\{[^}]+}", "([^/]+)")
     uri.matches(regex)
 
   private def handlePromptsList(id: RequestId): ZIO[Any, Nothing, Response] =
@@ -363,7 +414,9 @@ final class McpServer[-R] private (
       val r = JsonRpcResponse(id, result.toJsonAST.toOption.get)
       sseEvent(r.toJson)
 
-    val stream = messageStream ++ resultStream
+    val keepalive = ZStream.tick(30.seconds).as(": keepalive\n\n")
+
+    val stream = (messageStream ++ resultStream).merge(keepalive)
 
     Response(
       status = Status.Ok,

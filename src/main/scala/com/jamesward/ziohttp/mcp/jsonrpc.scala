@@ -15,7 +15,7 @@ object JsonRpcMessage:
 
   given JsonDecoder[JsonRpcMessage] = JsonDecoder[Json.Obj].mapOrFail: obj =>
     val jsonrpc = obj.get("jsonrpc").flatMap(_.asString)
-    if jsonrpc != Some(McpProtocol.JsonRpcVersion) then
+    if !jsonrpc.contains(McpProtocol.JsonRpcVersion) then
       Left(s"Expected jsonrpc: '${McpProtocol.JsonRpcVersion}'")
     else
       val method = obj.get("method").flatMap(_.asString)
