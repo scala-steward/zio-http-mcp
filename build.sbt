@@ -47,4 +47,6 @@ developers := List(
   )
 )
 
+Compile / doc / scalacOptions ++= Seq("-doc-root-content", (baseDirectory.value / "README.md").getAbsolutePath)
+
 ThisBuild / versionScheme := Some("semver-spec")
