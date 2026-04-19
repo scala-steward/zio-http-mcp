@@ -100,8 +100,8 @@ final class McpServer[-R] private (
           McpDispatchMethod.parse(method) match
             case Some(dm) => dispatchMethod(id, dm, params, statelessHandleToolsCall)
             case None     => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
-        case JsonRpcMessage.Notification(_, _) =>
-          ZIO.succeed(Response.ok)
+        case JsonRpcMessage.Notification(method, params) =>
+          ZIO.log(s"MCP Notification: $method $params").as(Response.status(Status.Accepted))
     yield response
 
   // --- Shared method dispatch (used by both stateful and stateless) ---
@@ -211,13 +211,13 @@ final class McpServer[-R] private (
             sessions.update(_.updatedWith(sid):
               case Some(_) => Some(SessionState.Active)
               case None    => None
-            ).as(Response.ok)
+            ).as(Response.status(Status.Accepted))
           case None =>
-            ZIO.succeed(Response.ok)
+            ZIO.succeed(Response.status(Status.Accepted))
       case Some(McpNotificationMethod.Cancelled) =>
-        ZIO.succeed(Response.ok)
+        ZIO.succeed(Response.status(Status.Accepted))
       case None =>
-        ZIO.succeed(Response.ok)
+        ZIO.succeed(Response.status(Status.Accepted))
 
   private def parseInitializeParams(
     id: RequestId,
